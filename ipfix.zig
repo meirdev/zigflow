@@ -1,13 +1,18 @@
 const std = @import("std");
 const mem = std.mem;
 const posix = std.posix;
-const Parser = @import("parser.zig").Parser;
+const parser_mod = @import("parser.zig");
+const formatter_mod = @import("formatter.zig");
 
+const Parser = parser_mod.Parser;
+const Formatter = formatter_mod.Formatter;
+const OutputFormat = formatter_mod.OutputFormat;
 const Writer = std.Io.Writer;
 
 const Config = struct {
     port: u16 = 4739,
     bind_addr: []const u8 = "0.0.0.0",
+    format: OutputFormat = .raw,
 };
 
 /// Parses command-line arguments and returns a Config struct.
@@ -26,6 +31,8 @@ fn parseArgs(args: []const []const u8) !Config {
             if (i < args.len) {
                 config.bind_addr = args[i];
             }
+        } else if (mem.eql(u8, args[i], "--json") or mem.eql(u8, args[i], "-j")) {
+            config.format = .json;
         }
     }
 
@@ -53,15 +60,20 @@ pub fn main() !void {
 
     try posix.bind(sockfd, &address.any, address.getOsSockLen());
 
-    var write_buf: [8192]u8 = undefined;
-    var file_writer = std.fs.File.writerStreaming(std.fs.File.stdout(), &write_buf);
-    const w = &file_writer.interface;
+    var stdout_buf: [8192]u8 = undefined;
+    var stdout_writer = std.fs.File.writerStreaming(std.fs.File.stdout(), &stdout_buf);
+    const w = &stdout_writer.interface;
 
-    var parser = try Parser.init(allocator, w);
+    var stderr_buf: [4096]u8 = undefined;
+    var stderr_writer = std.fs.File.writerStreaming(std.fs.File.stderr(), &stderr_buf);
+    const err_w = &stderr_writer.interface;
+
+    var formatter = Formatter.init(w, config.format);
+    var parser = try Parser.init(allocator, &formatter);
     defer parser.deinit();
 
-    try w.print("IPFIX collector listening on {s}:{d}\n", .{ config.bind_addr, config.port });
-    try w.flush();
+    try err_w.print("IPFIX collector listening on {s}:{d}\n", .{ config.bind_addr, config.port });
+    try err_w.flush();
 
     var recv_buf: [65535]u8 = undefined;
     while (true) {
@@ -75,13 +87,14 @@ pub fn main() !void {
             @ptrCast(&src_addr),
             &src_addr_len,
         ) catch |err| {
-            try w.print("recvfrom error: {}\n", .{err});
-            try w.flush();
+            try err_w.print("recvfrom error: {}\n", .{err});
+            try err_w.flush();
             continue;
         };
 
         parser.parseMessage(recv_buf[0..n]) catch |err| {
-            try w.print("parse error: {}\n", .{err});
+            try err_w.print("parse error: {}\n", .{err});
+            try err_w.flush();
         };
         try w.flush();
     }
