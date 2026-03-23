@@ -22,8 +22,6 @@ pub const Formatter = struct {
         return .{ .w = w, .format = format };
     }
 
-    // --- Message level ---
-
     pub fn messageBegin(self: *Formatter, export_time: u32, sequence_number: u32, observation_domain_id: u32, length: u16) Error!void {
         switch (self.format) {
             .raw => try self.w.print("IPFIX Message Header:\n\tLength: {d}\n\tExport time: {d}\n\tSequence number: {d}\n\tObservation domain ID: {d}\n", .{
