@@ -1,4 +1,4 @@
-.PHONY: fmt
+.PHONY: build
 
 build:
-	zig build-exe ipfix.zig
+	zig build

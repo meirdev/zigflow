@@ -1,11 +1,13 @@
 const std = @import("std");
 const ie_registry = @import("ie_registry.zig");
 const fmt = @import("formatter.zig");
+const rd = @import("reader.zig");
 
 const Allocator = std.mem.Allocator;
 const Reader = std.Io.Reader;
-const Formatter = fmt.Formatter;
-pub const OutputFormat = fmt.OutputFormat;
+pub const Formatter = fmt.Formatter;
+
+const SamplingRateMap = std.AutoHashMap(u32, u32);
 
 /// IPFIX version number.
 const ipfix_version = 10;
@@ -40,13 +42,14 @@ const Template = struct {
 
 const TemplateMap = std.AutoHashMap(u64, Template);
 
-const ParseError = Reader.Error || Formatter.Error || Allocator.Error;
+const ParseError = Reader.Error || fmt.Error || Allocator.Error;
 
 pub const Parser = struct {
     allocator: Allocator,
     templates: TemplateMap,
     registry: ie_registry.Registry,
     formatter: *Formatter,
+    sampling_rates: SamplingRateMap,
 
     pub fn init(allocator: Allocator, formatter: *Formatter) Allocator.Error!Parser {
         return .{
@@ -54,19 +57,26 @@ pub const Parser = struct {
             .templates = TemplateMap.init(allocator),
             .registry = try ie_registry.Registry.init(allocator),
             .formatter = formatter,
+            .sampling_rates = SamplingRateMap.init(allocator),
         };
     }
 
     pub fn deinit(self: *Parser) void {
-        self.registry.deinit();
+        var it = self.templates.valueIterator();
+        while (it.next()) |tmpl| {
+            self.allocator.free(tmpl.fields);
+        }
+
         self.templates.deinit();
+        self.sampling_rates.deinit();
+        self.registry.deinit();
     }
 
     fn templateKey(observation_domain_id: u32, template_id: u16) u64 {
         return (@as(u64, observation_domain_id) << 16) | template_id;
     }
 
-    pub fn parseMessage(self: *Parser, data: []const u8) ParseError!void {
+    pub fn parseMessage(self: *Parser, data: []const u8, sampler_address: ?[16]u8) ParseError!void {
         if (data.len < msg_header_len) return;
 
         var r: Reader = .fixed(data);
@@ -99,7 +109,7 @@ pub const Parser = struct {
             switch (set_id) {
                 template_set_id => try self.parseTemplateSet(observation_domain_id, set_data),
                 options_template_set_id => try self.parseOptionsTemplateSet(observation_domain_id, set_data),
-                min_data_set_id...max_data_set_id => try self.parseDataSet(observation_domain_id, set_id, set_data),
+                min_data_set_id...max_data_set_id => try self.parseDataSet(sequence_number, observation_domain_id, set_id, set_data, sampler_address),
                 else => {},
             }
 
@@ -109,10 +119,19 @@ pub const Parser = struct {
         try self.formatter.messageEnd();
     }
 
-    fn parseTemplateSet(
+    fn parseTemplateSet(self: *Parser, observation_domain_id: u32, data: []const u8) ParseError!void {
+        return self.parseTemplateRecords(observation_domain_id, data, false);
+    }
+
+    fn parseOptionsTemplateSet(self: *Parser, observation_domain_id: u32, data: []const u8) ParseError!void {
+        return self.parseTemplateRecords(observation_domain_id, data, true);
+    }
+
+    fn parseTemplateRecords(
         self: *Parser,
         observation_domain_id: u32,
         data: []const u8,
+        is_options: bool,
     ) ParseError!void {
         var r: Reader = .fixed(data);
         var record_num: u32 = 0;
@@ -120,11 +139,16 @@ pub const Parser = struct {
         while (true) {
             const template_id = r.takeInt(u16, .big) catch break;
             const field_count = r.takeInt(u16, .big) catch break;
+            const scope_field_count: u16 = if (is_options) r.takeInt(u16, .big) catch break else 0;
             record_num += 1;
 
             const key = templateKey(observation_domain_id, template_id);
 
-            try self.formatter.templateRecordBegin(record_num, template_id, field_count);
+            if (is_options) {
+                try self.formatter.optionsTemplateRecordBegin(record_num, template_id, field_count, scope_field_count);
+            } else {
+                try self.formatter.templateRecordBegin(record_num, template_id, field_count);
+            }
 
             const fields = try self.allocator.alloc(TemplateField, field_count);
 
@@ -165,76 +189,18 @@ pub const Parser = struct {
 
             if (!valid) break;
 
-            try self.templates.put(key, .{ .fields = fields, .scope_count = 0 });
-        }
-    }
-
-    fn parseOptionsTemplateSet(
-        self: *Parser,
-        observation_domain_id: u32,
-        data: []const u8,
-    ) ParseError!void {
-        var r: Reader = .fixed(data);
-        var record_num: u32 = 0;
-
-        while (true) {
-            const template_id = r.takeInt(u16, .big) catch break;
-            const total_field_count = r.takeInt(u16, .big) catch break;
-            const scope_field_count = r.takeInt(u16, .big) catch break;
-            record_num += 1;
-
-            const key = templateKey(observation_domain_id, template_id);
-
-            try self.formatter.optionsTemplateRecordBegin(record_num, template_id, total_field_count, scope_field_count);
-
-            const fields = try self.allocator.alloc(TemplateField, total_field_count);
-
-            var valid = true;
-            for (0..total_field_count) |i| {
-                const raw_id = r.takeInt(u16, .big) catch {
-                    valid = false;
-                    break;
-                };
-                const pen_bit = raw_id & 0x8000 != 0;
-                const field_id = raw_id & 0x7fff;
-                const field_length = r.takeInt(u16, .big) catch {
-                    valid = false;
-                    break;
-                };
-
-                var pen: ?u32 = null;
-                if (pen_bit) {
-                    pen = r.takeInt(u32, .big) catch {
-                        valid = false;
-                        break;
-                    };
-                }
-
-                fields[i] = .{
-                    .id = field_id,
-                    .length = field_length,
-                    .pen = pen,
-                };
-
-                const info = self.registry.lookup(field_id, pen);
-                const name = if (info) |f| f.name else null;
-                const data_type = if (info) |f| f.data_type else null;
-                try self.formatter.templateField(pen, field_id, field_length, name, data_type);
-            }
-
-            try self.formatter.templateRecordEnd();
-
-            if (!valid) break;
-
-            try self.templates.put(key, .{ .fields = fields, .scope_count = scope_field_count });
+            const old = try self.templates.fetchPut(key, .{ .fields = fields, .scope_count = scope_field_count });
+            if (old) |o| self.allocator.free(o.value.fields);
         }
     }
 
     fn parseDataSet(
         self: *Parser,
+        sequence_number: u32,
         observation_domain_id: u32,
         set_id: u16,
         data: []const u8,
+        sampler_address: ?[16]u8,
     ) ParseError!void {
         const key = templateKey(observation_domain_id, set_id);
 
@@ -243,7 +209,8 @@ pub const Parser = struct {
             return;
         };
 
-        try self.formatter.dataSetBegin(set_id);
+        const is_options = template.scope_count > 0;
+        try self.formatter.dataSetBegin(set_id, is_options);
 
         var r: Reader = .fixed(data);
         var record_num: u32 = 0;
@@ -254,7 +221,7 @@ pub const Parser = struct {
             const remaining = r.buffered();
             if (remaining.len < minRecordSize(template.fields)) break;
 
-            try self.formatter.recordBegin(record_num);
+            try self.formatter.recordBegin(record_num, sequence_number, observation_domain_id, set_id, sampler_address);
 
             for (template.fields, 0..) |field, idx| {
                 const actual_length: u16 = if (field.length == variable_length_marker) blk: {
@@ -269,6 +236,16 @@ pub const Parser = struct {
                 const value = r.take(actual_length) catch break :records;
                 const is_scope = idx < template.scope_count;
 
+                // Extract sampling rate from options template data records
+                if (field.pen == null) {
+                    const ie: ie_registry.IeId = @enumFromInt(field.id);
+                    if (ie == .sampling_interval or ie == .sampler_random_interval or ie == .sampling_packet_interval) {
+                        if (rd.readUnsigned(value)) |rate| {
+                            self.sampling_rates.put(observation_domain_id, std.math.cast(u32, rate) orelse 0) catch {};
+                        } else |_| {}
+                    }
+                }
+
                 if (self.registry.lookup(field.id, field.pen)) |info| {
                     try self.formatter.field(info.name, field.id, field.pen, is_scope, info.data_type, value);
                 } else {
@@ -276,7 +253,7 @@ pub const Parser = struct {
                 }
             }
 
-            try self.formatter.recordEnd();
+            try self.formatter.recordEnd(self.sampling_rates.get(observation_domain_id));
         }
 
         try self.formatter.dataSetEnd();

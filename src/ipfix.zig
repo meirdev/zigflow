@@ -1,13 +1,16 @@
 const std = @import("std");
+const parser_mod = @import("parser.zig");
+const raw_fmt = @import("raw_formatter.zig");
+const json_fmt = @import("json_formatter.zig");
+const proto_fmt = @import("protobuf_formatter.zig");
+
 const mem = std.mem;
 const posix = std.posix;
-const parser_mod = @import("parser.zig");
-const formatter_mod = @import("formatter.zig");
-
 const Parser = parser_mod.Parser;
-const Formatter = formatter_mod.Formatter;
-const OutputFormat = formatter_mod.OutputFormat;
+const Formatter = parser_mod.Formatter;
 const Writer = std.Io.Writer;
+
+const OutputFormat = enum { raw, json, protobuf };
 
 const Config = struct {
     port: u16 = 4739,
@@ -15,7 +18,6 @@ const Config = struct {
     format: OutputFormat = .raw,
 };
 
-/// Parses command-line arguments and returns a Config struct.
 fn parseArgs(args: []const []const u8) !Config {
     var config: Config = .{};
 
@@ -23,20 +25,40 @@ fn parseArgs(args: []const []const u8) !Config {
     while (i < args.len) : (i += 1) {
         if (mem.eql(u8, args[i], "--port") or mem.eql(u8, args[i], "-p")) {
             i += 1;
-            if (i < args.len) {
-                config.port = try std.fmt.parseInt(u16, args[i], 10);
+            if (i >= args.len) {
+                std.log.err("{s} requires a value", .{args[i - 1]});
+                return error.MissingArgValue;
             }
+            config.port = try std.fmt.parseInt(u16, args[i], 10);
         } else if (mem.eql(u8, args[i], "--bind") or mem.eql(u8, args[i], "-b")) {
             i += 1;
-            if (i < args.len) {
-                config.bind_addr = args[i];
+            if (i >= args.len) {
+                std.log.err("{s} requires a value", .{args[i - 1]});
+                return error.MissingArgValue;
             }
+            config.bind_addr = args[i];
         } else if (mem.eql(u8, args[i], "--json") or mem.eql(u8, args[i], "-j")) {
             config.format = .json;
+        } else if (mem.eql(u8, args[i], "--protobuf") or mem.eql(u8, args[i], "--proto")) {
+            config.format = .protobuf;
         }
     }
 
     return config;
+}
+
+fn extractSamplerAddr(storage: *const posix.sockaddr.storage) ?[16]u8 {
+    const family = @as(*const posix.sockaddr, @ptrCast(storage)).family;
+    if (family == posix.AF.INET) {
+        const sa: *const posix.sockaddr.in = @ptrCast(@alignCast(storage));
+        var addr: [16]u8 = .{0} ** 16;
+        addr[0..4].* = @bitCast(sa.addr);
+        return addr;
+    } else if (family == posix.AF.INET6) {
+        const sa: *const posix.sockaddr.in6 = @ptrCast(@alignCast(storage));
+        return sa.addr;
+    }
+    return null;
 }
 
 pub fn main() !void {
@@ -68,8 +90,17 @@ pub fn main() !void {
     var stderr_writer = std.fs.File.writerStreaming(std.fs.File.stderr(), &stderr_buf);
     const err_w = &stderr_writer.interface;
 
-    var formatter = Formatter.init(w, config.format);
-    var parser = try Parser.init(allocator, &formatter);
+    var raw = raw_fmt.RawFormatter.init(w);
+    var json = json_fmt.JsonFormatter.init(w);
+    var proto = proto_fmt.ProtobufFormatter.init(w);
+
+    const formatter: *Formatter = switch (config.format) {
+        .raw => &raw.interface,
+        .json => &json.interface,
+        .protobuf => &proto.interface,
+    };
+
+    var parser = try Parser.init(allocator, formatter);
     defer parser.deinit();
 
     try err_w.print("IPFIX collector listening on {s}:{d}\n", .{ config.bind_addr, config.port });
@@ -92,7 +123,7 @@ pub fn main() !void {
             continue;
         };
 
-        parser.parseMessage(recv_buf[0..n]) catch |err| {
+        parser.parseMessage(recv_buf[0..n], extractSamplerAddr(&src_addr)) catch |err| {
             try err_w.print("parse error: {}\n", .{err});
             try err_w.flush();
         };

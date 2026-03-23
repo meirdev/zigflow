@@ -21,6 +21,43 @@ pub const DataType = enum {
     sub_template_multi_list,
 };
 
+/// Subset of IANA IE IDs used by the parser and formatters.
+pub const IeId = enum(u16) {
+    octet_delta_count = 1,
+    packet_delta_count = 2,
+    protocol_identifier = 4,
+    tcp_control_bits = 6,
+    source_transport_port = 7,
+    source_ipv4_address = 8,
+    source_ipv4_prefix_length = 9,
+    ingress_interface = 10,
+    destination_transport_port = 11,
+    destination_ipv4_address = 12,
+    destination_ipv4_prefix_length = 13,
+    egress_interface = 14,
+    ip_next_hop_ipv4_address = 15,
+    bgp_source_as_number = 16,
+    bgp_destination_as_number = 17,
+    source_ipv6_address = 27,
+    destination_ipv6_address = 28,
+    source_ipv6_prefix_length = 29,
+    destination_ipv6_prefix_length = 30,
+    sampling_interval = 34,
+    sampler_random_interval = 50,
+    ip_next_hop_ipv6_address = 62,
+    flow_start_seconds = 150,
+    flow_end_seconds = 151,
+    flow_start_milliseconds = 152,
+    flow_end_milliseconds = 153,
+    flow_start_microseconds = 154,
+    flow_end_microseconds = 155,
+    flow_start_nanoseconds = 156,
+    flow_end_nanoseconds = 157,
+    ethernet_type = 256,
+    sampling_packet_interval = 305,
+    _,
+};
+
 /// Information Element (IE) metadata.
 pub const FieldInfo = struct {
     id: u16,
